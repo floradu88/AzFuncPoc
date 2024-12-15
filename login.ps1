@@ -1,0 +1,1 @@
+az login --tenant TENANT_ID e0fc89ac-6d1c-4d6e-ba27-814a675f99d0 'Florescu Radu'
