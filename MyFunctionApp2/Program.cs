@@ -3,6 +3,7 @@ using Microsoft.Extensions.Configuration;
 using Azure.Storage.Blobs;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.DependencyInjection;
+using MyFunctionApp.Helpers;
 
 var host = new HostBuilder()
     .ConfigureFunctionsWebApplication()
@@ -19,9 +20,19 @@ var host = new HostBuilder()
     })
     .ConfigureServices((context, services) =>
     {
-        // Use connection string from configuration
-        string connectionString = context.Configuration["BlobStorageConnectionString"];
-        services.AddSingleton(new BlobServiceClient(connectionString));
+        // Get Key Vault URI
+        string keyVaultUri = context.Configuration["KeyVaultUri"];
+
+        // Register KeyVaultHelper
+        var keyVaultHelper = new KeyVaultHelper(keyVaultUri);
+        services.AddSingleton(keyVaultHelper);
+
+        // Register BlobServiceClient
+        string blobConnectionString = keyVaultHelper.GetSecretAsync("BlobStorageConnectionString").Result;
+        services.AddSingleton(new BlobServiceClient(blobConnectionString));
+
+        // Register Func<string, Task<string>> for lazy secret retrieval
+        services.AddSingleton<Func<string, Task<string>>>(keyVaultHelper.GetSecretAsync);
     })
     .Build();
 
