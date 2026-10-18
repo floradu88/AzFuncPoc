@@ -1,74 +1,58 @@
 using System.Net.Http.Headers;
+using Azure.Identity;
+using Azure;
+using System.Text.Json;
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.WebJobs;
 using Microsoft.Extensions.Logging;
 using Renci.SshNet;
+using Microsoft.Azure.WebJobs.Extensions.EventGrid;
 
-public class MonitorSftpFunction(BlobServiceClient blobServiceClient, Func<string, Task<string>> getSecretAsync)
+using Azure.Messaging.EventGrid;
+using static System.Runtime.InteropServices.JavaScript.JSType;
+using System.Text;
+using MyFunctionApp.Helpers;
+
+public class MonitorSftpFunction(BlobServiceClient blobServiceClient, ILogger<MonitorSftpFunction> logger)
 {
     private readonly HttpClient _httpClient = new();
 
+    private const string AntimalwareScanEventType = "Microsoft.Security.MalwareScanningResult";
+    private const string MaliciousVerdict = "Malicious";
+    private const string CleanVerdict = "No threats found";
+    private const string MalwareContainer = "maliciousfiles";
+    private const string CleanContainer = "cleanfiles";
+    private const string InterestedContainer = "files";
+    private string _storageConnectionString;
+    private byte[] _encryptionKey; // Key for decryption
+
+
     [Function("MonitorSftpFunction")]
     public async Task Run(
-        [TimerTrigger("0 */1 * * * *")] TimerInfo timer,
+        [TimerTrigger("0 * * * * *")] TimerInfo timer,
         FunctionContext context)
     {
         var logger = context.GetLogger("MonitorSftpFunction");
 
         logger.LogInformation($"Timer trigger function executed at: {DateTime.Now}");
 
-        // Retrieve secrets lazily from Key Vault
-        string host = await getSecretAsync("SftpHost");
-        string username = await getSecretAsync("SftpUsername");
-        string password = await getSecretAsync("SftpPassword");
-        string blobContainerName = await getSecretAsync("BlobContainerName");
-        string malwareScanApiEndpoint = await getSecretAsync("MalwareScanApiEndpoint");
-        string malwareScanApiKey = await getSecretAsync("MalwareScanApiKey");
-
-        using var sftp = new SftpClient(host, username, password);
         try
         {
-            sftp.Connect();
-            logger.LogInformation("Connected to SFTP server");
+            BlobMoveHelper _blobHelper;
+            string storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+            string sourceContainer = "encrypted";
+            string destinationContainer = "file-scans";
+            string maliciousContainer = "malicious";
 
-            var files = sftp.ListDirectory("/");
-            foreach (var file in files)
-            {
-                if (!file.IsDirectory && !file.IsSymbolicLink)
-                {
-                        logger.LogInformation($"Processing file: {file.Name} - Last Modified: {file.LastWriteTime}");
+            _blobHelper = new BlobMoveHelper(storageConnectionString, sourceContainer, destinationContainer, maliciousContainer, logger);
 
-                    // Download file from SFTP
-                    using var fileStream = new MemoryStream();
-                    sftp.DownloadFile(file.FullName, fileStream);
-                    fileStream.Position = 0;
+            logger.LogInformation($"Move & Decrypt Job started at: {DateTime.UtcNow}");
 
-                    // Upload to Azure Blob Storage
-                    var blobContainer = blobServiceClient.GetBlobContainerClient(blobContainerName);
-                    var blobClient = blobContainer.GetBlobClient(file.Name);
-                    await blobClient.UploadAsync(fileStream, overwrite: true);
+            await _blobHelper.MoveFilesAsync();
 
-                    // Malware scanning
-                    logger.LogInformation($"Scanning blob '{file.Name}' for malware...");
-                    fileStream.Position = 0;
-
-                    using var content = new StreamContent(fileStream);
-                    content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-                    _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", malwareScanApiKey);
-
-                    var response = await _httpClient.PostAsync(malwareScanApiEndpoint, content);
-                    if (response.IsSuccessStatusCode)
-                    {
-                        string result = await response.Content.ReadAsStringAsync();
-                        logger.LogInformation($"Malware Scan Result: {result}");
-                    }
-                    else
-                    {
-                        string error = await response.Content.ReadAsStringAsync();
-                        logger.LogError($"Error scanning blob: {error}");
-                    }
-                }
-            }
+            logger.LogInformation($"Job completed at: {DateTime.UtcNow}");
         }
         catch (Exception ex)
         {
@@ -76,8 +60,130 @@ public class MonitorSftpFunction(BlobServiceClient blobServiceClient, Func<strin
         }
         finally
         {
-            sftp.Disconnect();
             logger.LogInformation("Disconnected from SFTP server");
         }
+    }
+
+    [FunctionName("MoveMaliciousBlobEventTrigger")]
+    public static async Task RunAsync([EventGridTrigger] EventGridEvent eventGridEvent, ILogger log)
+    {
+        if (eventGridEvent.EventType != AntimalwareScanEventType)
+        {
+            log.LogInformation("Event type is not an {0} event, event type:{1}", AntimalwareScanEventType, eventGridEvent.EventType);
+            return;
+        }
+
+        var storageAccountName = eventGridEvent?.Subject?.Split("/")[^1];
+        log.LogInformation("Received new scan result for storage {0}", storageAccountName);
+        var eventData = JsonDocument.Parse(eventGridEvent.Data).RootElement;
+        var verdict = eventData.GetProperty("scanResultType").GetString();
+        var blobETag = new ETag(eventData.GetProperty("eTag").GetString());
+        var blobUriString = eventData.GetProperty("blobUri").GetString();
+        var blobUri = new Uri(blobUriString);
+        var blobUriBuilder = new BlobUriBuilder(blobUri);
+
+        // Filter events from interested containers
+        if (blobUriBuilder.BlobContainerName != InterestedContainer)
+        {
+            log.LogInformation("Event is not from the interested containers, ignoring");
+            return;
+        }
+
+        if (verdict == null || blobUriString == null)
+        {
+            log.LogError("Event data doesn't contain 'verdict' or 'blobUri' fields");
+            throw new ArgumentException("Event data doesn't contain 'verdict' or 'blobUri' fields");
+        }
+
+        if (verdict == MaliciousVerdict)
+        {
+            log.LogInformation("blob {0} is malicious, moving it to {1} container", blobUri, MalwareContainer);
+            try
+            {
+                await MoveMaliciousBlobAsync(blobUri, blobETag, log);
+            }
+            catch (Exception e)
+            {
+                log.LogError(e, "Can't move blob to container '{0}'", MalwareContainer);
+                throw;
+            }
+        }
+
+        if (verdict == CleanVerdict)
+        {
+            log.LogInformation("blob {0} is malicious, moving it to {1} container", blobUri, CleanContainer);
+            try
+            {
+                await MoveCleanBlobAsync(blobUri, blobETag, log);
+            }
+            catch (Exception e)
+            {
+                log.LogError(e, "Can't move blob to container '{0}'", CleanContainer);
+                throw;
+            }
+        }
+    }
+
+    private static async Task MoveMaliciousBlobAsync(Uri blobUri, ETag blobETag, ILogger log)
+
+    {
+        var blobUriBuilder = new BlobUriBuilder(blobUri);
+        if (blobUriBuilder.BlobContainerName == MalwareContainer)
+        {
+            log.LogInformation("blob {0} is already in {1} container, skipping", blobUriBuilder.BlobName, MalwareContainer);
+            return;
+        }
+        var destContainerUri = new Uri($"https://{blobUriBuilder.Host}/{MalwareContainer}");
+        var defaultAzureCredential = new DefaultAzureCredential();
+        var srcBlobClient = new BlobClient(blobUri, defaultAzureCredential);
+        var destContainerClient = new BlobContainerClient(destContainerUri, defaultAzureCredential);
+        log.LogInformation("Creating {0} container if it doesn't exist", MalwareContainer);
+        await destContainerClient.CreateIfNotExistsAsync();
+        var destBlobClient = destContainerClient.GetBlobClient(blobUriBuilder.BlobName);
+
+        if (!await srcBlobClient.ExistsAsync())
+        {
+            log.LogError("blob {0} doesn't exist", blobUri);
+            return;
+        }
+
+        log.LogInformation("MoveBlob: Copying blob to {0}", destBlobClient.Uri);
+        var copyConditions = new BlobRequestConditions { IfMatch = blobETag };
+        var copyFromUriOperation = await destBlobClient.StartCopyFromUriAsync(srcBlobClient.Uri, sourceConditions: copyConditions);
+        await copyFromUriOperation.WaitForCompletionAsync();
+        log.LogInformation("MoveBlob: Deleting source blob {0}", srcBlobClient.Uri);
+        await srcBlobClient.DeleteAsync();
+        log.LogInformation("MoveBlob: blob moved successfully");
+    }
+
+    private static async Task MoveCleanBlobAsync(Uri blobUri, ETag blobETag, ILogger log)
+    {
+        var blobUriBuilder = new BlobUriBuilder(blobUri);
+        if (blobUriBuilder.BlobContainerName == CleanContainer)
+        {
+            log.LogInformation("blob {0} is already in {1} container, skipping", blobUriBuilder.BlobName, CleanContainer);
+            return;
+        }
+        var destContainerUri = new Uri($"https://{blobUriBuilder.Host}/{CleanContainer}");
+        var defaultAzureCredential = new DefaultAzureCredential();
+        var srcBlobClient = new BlobClient(blobUri, defaultAzureCredential);
+        var destContainerClient = new BlobContainerClient(destContainerUri, defaultAzureCredential);
+        log.LogInformation("Creating {0} container if it doesn't exist", CleanContainer);
+        await destContainerClient.CreateIfNotExistsAsync();
+        var destBlobClient = destContainerClient.GetBlobClient(blobUriBuilder.BlobName);
+
+        if (!await srcBlobClient.ExistsAsync())
+        {
+            log.LogError("blob {0} doesn't exist", blobUri);
+            return;
+        }
+
+        log.LogInformation("MoveBlob: Copying blob to {0}", destBlobClient.Uri);
+        var copyConditions = new BlobRequestConditions { IfMatch = blobETag };
+        var copyFromUriOperation = await destBlobClient.StartCopyFromUriAsync(srcBlobClient.Uri, sourceConditions: copyConditions);
+        await copyFromUriOperation.WaitForCompletionAsync();
+        log.LogInformation("MoveBlob: Deleting source blob {0}", srcBlobClient.Uri);
+        await srcBlobClient.DeleteAsync();
+        log.LogInformation("MoveBlob: blob moved successfully");
     }
 }

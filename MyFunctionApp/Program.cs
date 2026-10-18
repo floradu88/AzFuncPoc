@@ -21,18 +21,18 @@ var host = new HostBuilder()
     .ConfigureServices((context, services) =>
     {
         // Get Key Vault URI
-        string keyVaultUri = context.Configuration["KeyVaultUri"];
+        //string keyVaultUri = context.Configuration["KeyVaultUri"];
 
         // Register KeyVaultHelper
-        var keyVaultHelper = new KeyVaultHelper(keyVaultUri);
-        services.AddSingleton(keyVaultHelper);
+        //var keyVaultHelper = new KeyVaultHelper(keyVaultUri);
+        ////services.AddSingleton(keyVaultHelper);
 
         // Register BlobServiceClient
-        string blobConnectionString = keyVaultHelper.GetSecretAsync("BlobStorageConnectionString").Result;
+        string blobConnectionString = context.Configuration["AzureWebJobsStorage"];
         services.AddSingleton(new BlobServiceClient(blobConnectionString));
 
-        // Register Func<string, Task<string>> for lazy secret retrieval
-        services.AddSingleton<Func<string, Task<string>>>(keyVaultHelper.GetSecretAsync);
+        //// Register Func<string, Task<string>> for lazy secret retrieval
+        //services.AddSingleton<Func<string, Task<string>>>(keyVaultHelper.GetSecretAsync);
     })
     .Build();
 
